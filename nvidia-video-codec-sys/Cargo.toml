@@ -10,5 +10,7 @@ build = "build.rs"
 
 [build-dependencies]
 bindgen = "0.59.1"
+pkg-config = "0.3.26"
 
 [dependencies]
+libloading = "0.7.4"

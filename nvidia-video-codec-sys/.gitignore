@@ -3,3 +3,4 @@ src/cuvid.rs
 src/nvenc.rs
 src/nvenc.rs
 src/npp.rs
+src/encode_api.rs

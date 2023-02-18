@@ -1,6 +1,14 @@
-use super::{ffi, CudaResult};
+use std::ops::Deref;
 
+use crate::cuda::Cuda;
+use crate::cuda::context::CuContext;
+use crate::cuda::device::CuDevice;
+
+use super::ffi;
+
+use super::cuda::CudaResult;
 pub use ffi::cuvid::CUdeviceptr;
+use ffi::cuvid::CUresult;
 
 mod chroma;
 mod codec;
@@ -10,15 +18,53 @@ pub use self::chroma::VideoChromaFormat;
 pub use self::codec::Codec;
 pub use self::surface::VideoSurfaceFormat;
 
-pub struct Decoder {
-    inner: Box<Inner>,
+struct Cuvid<'a> {
+    lib: ffi::cuvid::nvcuvid,
+    cuda: &'a Cuda
+}
+impl<'a> Cuvid<'a> {
+    pub fn new(cuda: &Cuda) -> Result<Self, Box<dyn std::error::Error>> {
+        let library_name = libloading::library_filename("nvcuvid");
+        let lib = unsafe { ffi::cuvid::nvcuvid::new(library_name) }?;
+        Ok(Self { lib, cuda })
+    }
+
+    pub fn init(&self, flags: u32) -> Result<(), CUresult> {
+        unsafe { (*self).cuInit(flags).err() }
+    }
+
+    pub fn decoder(
+        &self,
+        codec: Codec,
+        keyframe_only: bool,
+        low_latency: bool,
+        output_size: (u32, u32),
+        device: Option<CuDevice>,
+        context: Option<CuContext>
+    ) -> Result<Decoder<'a>, CUresult> {
+        Decoder::new(&self, codec, keyframe_only, low_latency, output_size, device, context)
+    }
 }
 
-unsafe impl Send for Decoder {}
-unsafe impl Sync for Decoder {}
+impl Deref for Cuvid<'_> {
+    type Target = ffi::cuvid::nvcuvid;
 
-struct Inner {
-    parser: ffi::cuvid::CUvideoparser,
+    fn deref(&self) -> &Self::Target {
+        &self.lib
+    }
+}
+
+
+pub struct Decoder<'a> {
+    inner: Box<Inner<'a>>,
+}
+
+unsafe impl Send for Decoder<'_> {}
+unsafe impl Sync for Decoder<'_> {}
+
+struct Inner<'a> {
+        nvcuvid: &'a Cuvid<'a>,
+        parser: ffi::cuvid::CUvideoparser,
     lock: ffi::cuvid::CUvideoctxlock,
     context: super::cuda::context::CuContext,
     decoder: ffi::cuvid::CUvideodecoder,
@@ -50,7 +96,8 @@ impl PreparedFrame {
     }
 }
 
-pub struct GpuFrame {
+pub struct GpuFrame<'a> {
+    pub nvcuvid: &'a Cuvid<'a>,
     pub width: u32,
     pub height: u32,
     pub ptr: CUdeviceptr,
@@ -59,29 +106,31 @@ pub struct GpuFrame {
     decoder: ffi::cuvid::CUvideodecoder,
 }
 
-impl Drop for GpuFrame {
+impl Drop for GpuFrame<'_> {
     fn drop(&mut self) {
         unsafe {
-            if !ffi::cuda::cuCtxPopCurrent_v2(std::ptr::null_mut()).ok() {
+            if !self.nvcuvid.cuda.lib.cuCtxPopCurrent_v2(std::ptr::null_mut()).ok() {
                 tracing::error!("Failed to pop current context.");
             }
 
-            if !ffi::cuvid::cuvidUnmapVideoFrame64(self.decoder, self.ptr).ok() {
+            if !self.nvcuvid.lib.cuvidUnmapVideoFrame64(self.decoder, self.ptr).ok() {
                 tracing::error!("Failed to unmap current frame.");
             }
         }
     }
 }
 
-impl Decoder {
-    pub fn create(
-        gpu_id: usize,
+impl Decoder<'_> {
+    pub(crate) fn new(
+        nvcuvid: &Cuvid,
         codec: Codec,
         keyframe_only: bool,
         low_latency: bool,
         output_size: (u32, u32),
+        device: Option<CuDevice>,
+        context: Option<CuContext>
     ) -> Result<Self, ffi::cuda::CUresult> {
-        let device = super::cuda::device::CuDevice::new(gpu_id as _)?;
+        let device = device.unwrap_or_else(|| {});
         let context = super::cuda::context::CuContext::new(device, 0)?;
 
         let mut parser: ffi::cuvid::CUvideoparser = std::ptr::null_mut();
@@ -89,7 +138,7 @@ impl Decoder {
 
         unsafe {
             let res = ffi::cuvid::cuvidCtxLockCreate(&mut ctx_lock, context.context as _);
-            wrap!(res, res)?;
+            res.err()?;
         }
         let (sender, receiver) = flume::unbounded();
 
@@ -126,7 +175,7 @@ impl Decoder {
 
         unsafe {
             let res = ffi::cuvid::cuvidCreateVideoParser(&mut parser, &mut params);
-            wrap!(res, res)?;
+            res.err()?;
         }
         inner.parser = parser;
 
@@ -143,7 +192,7 @@ impl Decoder {
 
         unsafe {
             let res = ffi::cuvid::cuvidParseVideoData(self.inner.parser, &mut packet);
-            wrap!(res, res)?;
+            res.err()?;
         }
 
         Ok(())
@@ -156,7 +205,7 @@ impl Decoder {
 
         unsafe {
             let res = ffi::cuvid::cuvidParseVideoData(self.inner.parser, &mut packet);
-            wrap!(res, res)?;
+            res.err()?;
         }
 
         Ok(())

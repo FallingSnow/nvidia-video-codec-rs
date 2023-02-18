@@ -1,164 +1,40 @@
-use std::cell::RefCell;
-use std::mem::MaybeUninit;
+//! # NVIDIA VIDEO CODEC SDK - ENCODER vNVENCODEAPI_PG-06155-001_v11 | 2
+//! 
+//! # Basic Encoding Flow
+//! 
+//! Developers can create a client application that calls NVENCODE API functions exposed
+//! by nvEncodeAPI.dll for Windows or libnvidia-encode.so for Linux. These libraries are
+//! installed as part of the NVIDIA display driver. The client application can either link to these
+//! libraries at run-time using LoadLibrary() on Windows or dlopen() on Linux.
+//! The NVENCODE API functions, structures and other parameters are exposed in nvEncodeAPI.h,
+//! which is included in the SDK.
+//! 
+//! NVENCODE API is a C-API, and uses a design pattern like C++ interfaces, wherein the application
+//! creates an instance of the API and retrieves a function pointer table to further interact with the
+//! encoder. For programmers preferring more high-level API with ready-to-use code, SDK includes
+//! sample C++ classes expose important API functions.
+//! 
+//! Rest of this document focuses on the C-API exposed in nvEncodeAPI.h. NVENCODE API is
+//! designed to accept raw video frames (in YUV or RGB format) and output the H.264, HEVC or AV1
+//! bitstream. Broadly, the encoding flow consists of the following steps:
+//! 
+//!   1. Initialize the encoder
+//!   2. Set up the desired encoding parameters
+//!   3. Allocate input/output buffers
+//!   4. Copy frames to input buffers and read bitstream from the output buffers. This can be done synchronously (Windows & Linux) or asynchronously (Windows 7 and above only).
+//!   5. Clean-up - release all allocated input/output buffers
+//!   6. Close the encoding session
+//! 
+//! These steps are explained in the rest of the document and demonstrated in the sample
+//! application included in the Video Codec SDK package.
+//! 
+//! -- See (Nvidia Encoder Programming Guide)[https://docs.nvidia.com/video-technologies/video-codec-sdk/nvenc-video-encoder-api-prog-guide/] for more info
 
 extern crate nvidia_video_codec_sys as ffi;
-
-#[macro_use]
-mod macros;
+#[cfg(test)]
+extern crate tracing_test;
 
 pub mod cuda;
-pub mod cuvid;
-
-thread_local! {
-    static INIT: RefCell<Option<()>> = RefCell::new(None);
-}
-
-pub fn init() {
-    INIT.with(|init| {
-        let mut status = init.borrow_mut();
-        if status.is_none() {
-            let _ = unsafe { ffi::cuvid::cuInit(0) };
-            status.replace(());
-        }
-    });
-}
-
-pub trait CudaResult {
-    fn ok(&self) -> bool;
-    fn err(&self) -> Result<(), Self>
-    where
-        Self: Sized;
-}
-
-impl CudaResult for ffi::cuda::CUresult {
-    fn ok(&self) -> bool {
-        return *self == ffi::cuda::cudaError_enum_CUDA_SUCCESS;
-    }
-
-    fn err(&self) -> Result<(), Self> {
-        if *self == ffi::cuda::cudaError_enum_CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(*self)
-        }
-    }
-}
-
-pub trait NppResult {
-    fn ok(&self) -> bool;
-    fn err(&self) -> Result<(), Self>
-    where
-        Self: Sized;
-}
-
-impl NppResult for ffi::npp::NppStatus {
-    fn ok(&self) -> bool {
-        return *self == ffi::npp::NppStatus_NPP_SUCCESS;
-    }
-
-    fn err(&self) -> Result<(), Self> {
-        if *self == ffi::npp::NppStatus_NPP_SUCCESS {
-            Ok(())
-        } else {
-            Err(*self)
-        }
-    }
-}
-
-pub fn nv12_to_rgb24(
-    ptr: ffi::cuvid::CUdeviceptr,
-    width: u32,
-    height: u32,
-    pitch: i32,
-    dest_ptr: *mut std::os::raw::c_void,
-    dest_pitch: i32,
-    stream: Option<&cuda::stream::CuStream>,
-) -> Result<(), ffi::npp::NppStatus> {
-    let src: [*const ffi::npp::Npp8u; 2] = unsafe {
-        [
-            (ptr as *const ffi::npp::Npp8u),
-            (ptr as *const ffi::npp::Npp8u).offset((pitch * (height as i32)) as isize),
-        ]
-    };
-    let size_roi = ffi::npp::NppiSize {
-        width: width as _,
-        height: height as _,
-    };
-
-    if let Some(stream) = stream {
-        unsafe {
-            if ffi::npp::nppGetStream() != (stream.stream as _) {
-                ffi::npp::nppSetStream(stream.stream as _);
-            }
-        }
-    }
-
-    let stream_ctx = unsafe {
-        let mut ctx: MaybeUninit<ffi::npp::NppStreamContext> = MaybeUninit::uninit();
-        ffi::npp::nppGetStreamContext(ctx.as_mut_ptr()).err()?;
-        ctx.assume_init()
-    };
-
-    unsafe {
-        ffi::npp::nppiNV12ToRGB_8u_P2C3R_Ctx(
-            src.as_ptr(),
-            pitch,
-            dest_ptr as _,
-            dest_pitch,
-            size_roi,
-            stream_ctx,
-        )
-        .err()?;
-    }
-
-    Ok(())
-}
-
-pub fn nv12_to_bgr24(
-    ptr: ffi::cuvid::CUdeviceptr,
-    width: u32,
-    height: u32,
-    pitch: i32,
-    dest_ptr: *mut std::os::raw::c_void,
-    dest_pitch: i32,
-    stream: Option<&cuda::stream::CuStream>,
-) -> Result<(), ffi::npp::NppStatus> {
-    let src: [*const ffi::npp::Npp8u; 2] = unsafe {
-        [
-            (ptr as *const ffi::npp::Npp8u),
-            (ptr as *const ffi::npp::Npp8u).offset((pitch * (height as i32)) as isize),
-        ]
-    };
-    let size_roi = ffi::npp::NppiSize {
-        width: width as _,
-        height: height as _,
-    };
-
-    if let Some(stream) = stream {
-        unsafe {
-            if ffi::npp::nppGetStream() != (stream.stream as _) {
-                ffi::npp::nppSetStream(stream.stream as _);
-            }
-        }
-    }
-
-    let stream_ctx = unsafe {
-        let mut ctx: MaybeUninit<ffi::npp::NppStreamContext> = MaybeUninit::uninit();
-        ffi::npp::nppGetStreamContext(ctx.as_mut_ptr()).err()?;
-        ctx.assume_init()
-    };
-
-    unsafe {
-        ffi::npp::nppiNV12ToBGR_8u_P2C3R_Ctx(
-            src.as_ptr(),
-            pitch,
-            dest_ptr as _,
-            dest_pitch,
-            size_roi,
-            stream_ctx,
-        )
-        .err()?;
-    }
-
-    Ok(())
-}
+// pub mod cuvid;
+// pub mod npp;
+pub mod encode;
